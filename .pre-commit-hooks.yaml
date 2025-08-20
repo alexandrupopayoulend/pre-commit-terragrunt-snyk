@@ -1,8 +1,10 @@
 - id: snyk-terragrunt
-  name: Snyk IaC scan for Terragrunt stacks
+  name: Snyk IaC for Terragrunt (plan all env.hcl dirs)
+  description: Always run terragrunt plan in every dir containing env.hcl, then scan rendered IaC with Snyk
   entry: hooks/snyk_terragrunt.sh
   language: script
-  files: '(^|/)terragrunt\.hcl$'
-  pass_filenames: true
+  # Run on every commit regardless of the files changed
+  always_run: true
+  # We don’t need filenames from pre-commit
+  pass_filenames: false
   require_serial: true
-  args: ['bash', '-c', 'hooks/snyk_terragrunt.sh "$@"', '--']

@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${SNYK_SEVERITY:=medium}"      # low|medium|high|critical
-: "${SNYK_ORG:=}"
-: "${SNYK_ADDITIONAL_ARGS:=}"
-: "${TERRAGRUNT_SNYK_PLAN:=0}"    # 1 to try a quick 'terragrunt plan' to populate cache
+# Always:
+#  1) locate all directories having env.hcl
+#  2) run 'terragrunt plan' in each (fast/lightweight flags)
+#  3) scan the rendered Terraform under .terragrunt-cache with Snyk IaC
+
+: "${SNYK_SEVERITY:=medium}"       # low|medium|high|critical
+: "${SNYK_ORG:=}"                  # optional
+: "${SNYK_ADDITIONAL_ARGS:=}"      # e.g. "--report --sarif-file-output=iac.sarif"
+: "${TG_PLAN_ARGS:=-lock=false -input=false -no-color}"  # tweak if needed
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "$1 not found"; exit 1; }; }
-need snyk
 need terragrunt
+need snyk
 
 # Ensure Snyk is authed (token env OR already authed)
 if ! snyk config get api >/dev/null 2>&1; then
@@ -20,22 +25,27 @@ if ! snyk config get api >/dev/null 2>&1; then
   fi
 fi
 
-# Build list of terragrunt stack dirs from filenames (safe with -u)
-stack_dirs=()
-for f in "$@"; do
-  if [ -f "$f" ]; then
-    d="$(cd "$(dirname "$f")" && pwd)"
-    # de-dupe safely even if array is empty
+# Find all env.hcl directories. Prefer git (faster, respects repo root); fall back to find(1).
+env_dirs=()
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  while IFS= read -r -d '' f; do
+    d="$(dirname "$f")"
+    # de-dupe
     seen=0
-    for s in ${stack_dirs+"${stack_dirs[@]}"}; do
-      [ "$s" = "$d" ] && seen=1 && break
-    done
-    [ $seen -eq 0 ] && stack_dirs+=("$d")
-  fi
-done
+    for s in ${env_dirs+"${env_dirs[@]}"}; do [ "$s" = "$d" ] && seen=1 && break; done
+    [ $seen -eq 0 ] && env_dirs+=("$d")
+  done < <(git ls-files -z -- '*env.hcl')
+else
+  while IFS= read -r -d '' f; do
+    d="$(dirname "$f")"
+    seen=0
+    for s in ${env_dirs+"${env_dirs[@]}"}; do [ "$s" = "$d" ] && seen=1 && break; done
+    [ $seen -eq 0 ] && env_dirs+=("$d")
+  done < <(find . -type f -name 'env.hcl' -print0 2>/dev/null || true)
+fi
 
-if [ "${#stack_dirs[@]}" -eq 0 ]; then
-  echo "No Terragrunt files to scan."
+if [ "${#env_dirs[@]}" -eq 0 ]; then
+  echo "No env.hcl found. Nothing to plan/scan."
   exit 0
 fi
 
@@ -44,52 +54,46 @@ if [ "${SNYK_UPDATE_RULES:-1}" = "1" ]; then
   snyk iac rules update >/dev/null || true
 fi
 
-# Helper: find cache subdirs that actually contain Terraform (.tf)
-find_cache_targets() {
+# Helper: list cache subdirs that contain at least one .tf
+cache_targets_for_dir() {
   dir="$1"
-  if [ -d "$dir/.terragrunt-cache" ]; then
-    # Only keep directories that contain at least one .tf file.
-    find "$dir/.terragrunt-cache" -type f -name '*.tf' -print0 2>/dev/null \
-      | xargs -0 -I{} dirname "{}" 2>/dev/null \
-      | sort -u
-  fi
+  [ -d "$dir/.terragrunt-cache" ] || return 0
+  find "$dir/.terragrunt-cache" -type f -name '*.tf' -print0 2>/dev/null \
+    | xargs -0 -I{} dirname "{}" 2>/dev/null \
+    | sort -u
 }
 
-# If allowed, try to populate cache via 'terragrunt plan' (quick, but needs creds)
-populate_cache_if_needed() {
-  dir="$1"
-  if [ "$TERRAGRUNT_SNYK_PLAN" = "1" ]; then
-    ( cd "$dir" && terragrunt plan -lock=false -out=/dev/null >/dev/null ) || true
-  fi
-}
+# 1) Run terragrunt plan in each env dir to populate cache (don’t fail the whole hook if one plan fails)
+for d in "${env_dirs[@]}"; do
+  echo "Planning in: $d"
+  (
+    cd "$d"
+    # Best-effort plan to warm the cache; ignore non-zero to continue scanning others
+    terragrunt plan ${TG_PLAN_ARGS} -out=/dev/null >/dev/null || true
+  )
+done
 
-# Collect scan targets (safe expansions)
+# 2) Gather scan targets from all caches
 scan_targets=()
-for sd in "${stack_dirs[@]}"; do
-  populate_cache_if_needed "$sd"
+for d in "${env_dirs[@]}"; do
   while IFS= read -r target; do
     [ -d "$target" ] || continue
     present=0
-    for t in ${scan_targets+"${scan_targets[@]}"}; do
-      [ "$t" = "$target" ] && present=1 && break
-    done
+    for t in ${scan_targets+"${scan_targets[@]}"}; do [ "$t" = "$target" ] && present=1 && break; done
     [ $present -eq 0 ] && scan_targets+=("$target")
   done <<EOF
-$(find_cache_targets "$sd")
+$(cache_targets_for_dir "$d")
 EOF
 done
 
 if [ "${#scan_targets[@]}" -eq 0 ]; then
-  echo "No rendered Terraform found under .terragrunt-cache for changed stacks."
-  echo "Hints:"
-  echo "  - Run 'terragrunt plan' locally to populate .terragrunt-cache, or"
-  echo "  - Set TERRAGRUNT_SNYK_PLAN=1 to let the hook attempt a quick plan (requires creds), or"
-  echo "  - Run Snyk IaC in CI against a planned JSON (outside pre-commit)."
+  echo "No rendered Terraform found under .terragrunt-cache after planning."
+  echo "Check credentials/backends or run a manual 'terragrunt plan' to verify."
   exit 0
 fi
 
-echo "Snyk IaC: scanning ${#scan_targets[@]} Terragrunt cache dir(s)..."
-
+# 3) Snyk IaC scan each target directory
+echo "Snyk IaC: scanning ${#scan_targets[@]} cache dir(s)..."
 common_args=( "iac" "test" "--severity-threshold=${SNYK_SEVERITY}" )
 [ -n "$SNYK_ORG" ] && common_args+=( "--org=${SNYK_ORG}" )
 
