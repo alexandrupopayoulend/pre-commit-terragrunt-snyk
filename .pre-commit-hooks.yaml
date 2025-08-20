@@ -1,8 +1,8 @@
-- id: snyk-terragrunt
-  name: Snyk IaC scan for Terragrunt stacks
+- id: snyk-terragrunt-plans
+  name: Snyk IaC on Terragrunt plan JSONs (env.hcl dirs)
+  description: Always run terragrunt plan in every dir with env.hcl, export tfplan.json, then scan with Snyk --scan=planned-values
   entry: hooks/snyk_terragrunt.sh
   language: script
-  files: '(^|/)terragrunt\.hcl$'
-  pass_filenames: true
+  always_run: true
+  pass_filenames: false
   require_serial: true
-  args: ['bash', '-c', 'hooks/snyk_terragrunt.sh "$@"', '--']
