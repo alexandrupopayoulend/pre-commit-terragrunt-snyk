@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Snyk IaC for Terragrunt:
-# - Triggers on terragrunt.hcl changes.
-# - Finds rendered Terraform under .terragrunt-cache and scans those dirs with Snyk.
-# - Optional: TERRAGRUNT_SNYK_PLAN=1 to run a quick 'terragrunt plan' to populate cache.
-
 : "${SNYK_SEVERITY:=medium}"      # low|medium|high|critical
-: "${SNYK_ORG:=}"                 # Snyk org (optional)
-: "${SNYK_ADDITIONAL_ARGS:=}"     # extra args, e.g. "--report --sarif-file-output=iac.sarif"
-: "${TERRAGRUNT_SNYK_PLAN:=0}"    # 1 to attempt 'terragrunt plan' to populate cache (requires creds)
+: "${SNYK_ORG:=}"
+: "${SNYK_ADDITIONAL_ARGS:=}"
+: "${TERRAGRUNT_SNYK_PLAN:=0}"    # 1 to try a quick 'terragrunt plan' to populate cache
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "$1 not found"; exit 1; }; }
 need snyk
@@ -25,19 +20,24 @@ if ! snyk config get api >/dev/null 2>&1; then
   fi
 fi
 
-# Build list of terragrunt stack dirs from filenames
+# Build list of terragrunt stack dirs from filenames (safe with -u)
 stack_dirs=()
 for f in "$@"; do
   if [ -f "$f" ]; then
     d="$(cd "$(dirname "$f")" && pwd)"
-    # dedupe
+    # de-dupe safely even if array is empty
     seen=0
-    for s in "${stack_dirs[@]}"; do [ "$s" = "$d" ] && seen=1 && break; done
+    for s in ${stack_dirs+"${stack_dirs[@]}"}; do
+      [ "$s" = "$d" ] && seen=1 && break
+    done
     [ $seen -eq 0 ] && stack_dirs+=("$d")
   fi
 done
 
-[ ${#stack_dirs[@]} -eq 0 ] && { echo "No Terragrunt files to scan."; exit 0; }
+if [ "${#stack_dirs[@]}" -eq 0 ]; then
+  echo "No Terragrunt files to scan."
+  exit 0
+fi
 
 # Optionally keep IaC rules current (fast no-op if already updated)
 if [ "${SNYK_UPDATE_RULES:-1}" = "1" ]; then
@@ -48,11 +48,10 @@ fi
 find_cache_targets() {
   dir="$1"
   if [ -d "$dir/.terragrunt-cache" ]; then
-    # Look one or two levels down; Terragrunt hashes module paths.
-    # We only keep directories that contain at least one .tf file.
+    # Only keep directories that contain at least one .tf file.
     find "$dir/.terragrunt-cache" -type f -name '*.tf' -print0 2>/dev/null \
-    | xargs -0 -I{} dirname "{}" 2>/dev/null \
-    | sort -u
+      | xargs -0 -I{} dirname "{}" 2>/dev/null \
+      | sort -u
   fi
 }
 
@@ -64,25 +63,23 @@ populate_cache_if_needed() {
   fi
 }
 
-# Collect scan targets
+# Collect scan targets (safe expansions)
 scan_targets=()
 for sd in "${stack_dirs[@]}"; do
-  # Optionally populate cache (no-op if disabled)
   populate_cache_if_needed "$sd"
-
-  # Gather cache dirs that have .tf
   while IFS= read -r target; do
     [ -d "$target" ] || continue
-    # de-dupe
     present=0
-    for t in "${scan_targets[@]}"; do [ "$t" = "$target" ] && present=1 && break; done
+    for t in ${scan_targets+"${scan_targets[@]}"}; do
+      [ "$t" = "$target" ] && present=1 && break
+    done
     [ $present -eq 0 ] && scan_targets+=("$target")
   done <<EOF
 $(find_cache_targets "$sd")
 EOF
 done
 
-if [ ${#scan_targets[@]} -eq 0 ]; then
+if [ "${#scan_targets[@]}" -eq 0 ]; then
   echo "No rendered Terraform found under .terragrunt-cache for changed stacks."
   echo "Hints:"
   echo "  - Run 'terragrunt plan' locally to populate .terragrunt-cache, or"
