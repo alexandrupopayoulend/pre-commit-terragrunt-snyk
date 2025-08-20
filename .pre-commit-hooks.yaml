@@ -1,0 +1,8 @@
+- id: snyk-iac
+  name: Snyk IaC scan (Terraform/Terragrunt)
+  description: Run `snyk iac test` on changed Terraform/Terragrunt files and relevant dirs
+  entry: hooks/snyk_iac.sh
+  language: script
+  files: \.(tf|tfvars|hcl|hcl\.json)$
+  pass_filenames: true
+  require_serial: true
