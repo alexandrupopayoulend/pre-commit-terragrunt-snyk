@@ -1,8 +1,9 @@
-- id: snyk-iac
-  name: Snyk IaC scan (Terraform/Terragrunt)
-  entry: hooks/snyk_iac.sh
+- id: snyk-terragrunt
+  name: Snyk IaC scan for Terragrunt stacks
+  description: Run `snyk iac test` against Terraform rendered in .terragrunt-cache for changed Terragrunt stacks
+  entry: hooks/snyk_terragrunt.sh
   language: script
-  files: \.(tf|tfvars|hcl|hcl\.json)$
+  # Trigger only on terragrunt files. If you keep other .hcl files, narrow to (^|/)terragrunt\.hcl$
+  files: '(^|/)terragrunt\.hcl$'
   pass_filenames: true
   require_serial: true
-  args: ['bash', '-c', 'hooks/snyk_iac.sh "$@"', '--']
