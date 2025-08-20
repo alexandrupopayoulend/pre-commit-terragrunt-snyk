@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pre-commit hook: run Snyk IaC test on changed Terraform/Terragrunt files.
-# Requirements:
-#   - SNYK_TOKEN set (or you are already authenticated via `snyk auth`)
-#   - snyk CLI installed: https://docs.snyk.io/snyk-cli/install-the-snyk-cli
-#   - Optional: terragrunt installed if you also use the fmt hook
-
-# Config via env vars:
 : "${SNYK_SEVERITY:=medium}"     # low|medium|high|critical
 : "${SNYK_ORG:=}"                # set if you need to target a specific org
 : "${SNYK_ADDITIONAL_ARGS:=}"    # e.g., "--scan=resource-changes --report"
@@ -18,8 +11,8 @@ if ! command -v snyk >/dev/null 2>&1; then
 fi
 
 # Ensure auth (either token env var or existing auth)
-if ! snyk config get api > /dev/null 2>&1; then
-  if [[ -n "${SNYK_TOKEN:-}" ]]; then
+if ! snyk config get api >/dev/null 2>&1; then
+  if [ -n "${SNYK_TOKEN:-}" ]; then
     snyk auth "${SNYK_TOKEN}" >/dev/null
   else
     echo "Snyk CLI not authenticated. Run 'snyk auth' or set SNYK_TOKEN."
@@ -27,7 +20,7 @@ if ! snyk config get api > /dev/null 2>&1; then
   fi
 fi
 
-# Filter to files that still exist and are relevant to IaC scans
+# filters
 is_iac() {
   case "$1" in
     *.tf|*.tfvars|*.hcl|*.hcl.json) return 0 ;;
@@ -35,54 +28,58 @@ is_iac() {
   esac
 }
 
-mapfile -t changed_files < <(
-  for f in "$@"; do
-    [[ -f "$f" ]] && is_iac "$f" && echo "$f"
-  done | sort -u
-)
+ignore_patterns=( ".terragrunt-cache" ".terraform" )
 
-if [[ ${#changed_files[@]} -eq 0 ]]; then
+in_ignored_path() {
+  _p="$1"
+  for pat in "${ignore_patterns[@]}"; do
+    case "$_p" in
+      *"/$pat/"*|"$pat"*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Build list of targets from args (no mapfile)
+targets=()
+for f in "$@"; do
+  if [ -f "$f" ] && is_iac "$f" && ! in_ignored_path "$f"; then
+    targets+=("$f")
+  fi
+done
+
+# Deduplicate while preserving order
+deduped=()
+seen=""
+for f in "${targets[@]}"; do
+  case " $seen " in
+    *" $f "*) : ;;
+    *) deduped+=("$f"); seen="$seen $f" ;;
+  esac
+done
+targets=("${deduped[@]}")
+
+if [ ${#targets[@]} -eq 0 ]; then
   echo "No Terraform/Terragrunt files to scan."
   exit 0
 fi
 
-# Build the argument list. Snyk can take many files at once; we’ll chunk to be safe.
-common_args=( "iac" "test" "--severity-threshold=${SNYK_SEVERITY}" )
-[[ -n "${SNYK_ORG}" ]] && common_args+=( "--org=${SNYK_ORG}" )
-
-# Exclude common noisy paths
-ignore_patterns=( ".terragrunt-cache" ".terraform" )
-
-filter_out_noise() {
-  while IFS= read -r p; do
-    skip=0
-    for pat in "${ignore_patterns[@]}"; do
-      if [[ "$p" == *"/${pat}/"* ]] || [[ "$p" == "${pat}"* ]]; then
-        skip=1; break
-      fi
-    done
-    [[ $skip -eq 0 ]] && echo "$p"
-  done
-}
-
-mapfile -t targets < <(printf '%s\n' "${changed_files[@]}" | filter_out_noise)
-
-if [[ ${#targets[@]} -eq 0 ]]; then
-  echo "All changes are in ignored paths; nothing to scan."
-  exit 0
-fi
-
-# Optionally keep rules up to date (no-op if already latest). Skip on CI if you prefer speed.
-if [[ "${SNYK_UPDATE_RULES:-1}" == "1" ]]; then
+# Optionally update rules
+if [ "${SNYK_UPDATE_RULES:-1}" = "1" ]; then
   snyk iac rules update >/dev/null || true
 fi
 
 echo "Running Snyk IaC on ${#targets[@]} file(s)..."
-# Chunk to avoid very long command lines
+
+common_args=( "iac" "test" "--severity-threshold=${SNYK_SEVERITY}" )
+[ -n "${SNYK_ORG}" ] && common_args+=( "--org=${SNYK_ORG}" )
+
+# Chunk to avoid very long commands
 chunk_size=50
 i=0
 rc=0
-while [[ $i -lt ${#targets[@]} ]]; do
+total=${#targets[@]}
+while [ $i -lt $total ]; do
   chunk=( "${targets[@]:$i:$chunk_size}" )
   # shellcheck disable=SC2086
   if ! snyk "${common_args[@]}" ${SNYK_ADDITIONAL_ARGS} "${chunk[@]}"; then
