@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
+# Minimal, portable flow:
+#   - find dirs with env.hcl
+#   - in each: terragrunt plan -out=tf.plan (with flags)
+#              terraform show -json tf.plan > tfplan.json
+#   - snyk iac test --scan=planned-values tfplan.json (all)
+
 set -euo pipefail
 
-# Workflow:
-#   - discover all dirs containing env.hcl
-#   - terragrunt plan -> <dir>/.terragrunt-snyk/plan.bin
-#   - terraform show -json plan.bin -> <dir>/.terragrunt-snyk/tfplan.json
-#   - snyk iac test --scan=planned-values tfplan.json
-
+: "${TF_PLAN_ARGS:=-input=false -no-color -lock=false -refresh=false}"
 : "${SNYK_SEVERITY:=medium}"            # low|medium|high|critical
 : "${SNYK_ORG:=}"                       # optional
 : "${SNYK_ADDITIONAL_ARGS:=}"           # e.g. "--report --sarif-file-output=iac.sarif"
-: "${TG_PLAN_ARGS:=-lock=false -input=false -no-color}"
-: "${TG_PARALLELISM:=1}"                # set >1 if you want concurrent plans (hook runs serially by default)
+: "${SNYK_UPDATE_RULES:=1}"             # set 0 to skip snyk rules update
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "$1 not found"; exit 1; }; }
 need terragrunt
 need terraform
 need snyk
 
-# Snyk auth
+# Non-interactive Terraform
+export TF_INPUT=0
+export TF_IN_AUTOMATION=1
+
+# If a token is present, auth Snyk; otherwise rely on prior auth
 if ! snyk config get api >/dev/null 2>&1; then
   if [ -n "${SNYK_TOKEN:-}" ]; then
     snyk auth "${SNYK_TOKEN}" >/dev/null
@@ -28,9 +32,15 @@ if ! snyk config get api >/dev/null 2>&1; then
   fi
 fi
 
-# Find all env.hcl directories
-env_dirs=()
+# Move to repo root if inside git (makes discovery predictable)
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  cd "$(git rev-parse --show-toplevel)"
+fi
+
+# Discover env roots (dirs containing env.hcl)
+env_dirs=()
+# Prefer git (fast, respects ignores), fall back to find
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   while IFS= read -r -d '' f; do
     d="$(dirname "$f")"
     seen=0
@@ -51,33 +61,45 @@ if [ "${#env_dirs[@]}" -eq 0 ]; then
   exit 0
 fi
 
-# (Optional) keep Snyk IaC rules updated (fast no-op if current)
-if [ "${SNYK_UPDATE_RULES:-1}" = "1" ]; then
+# (Optional) keep Snyk IaC rules current
+if [ "$SNYK_UPDATE_RULES" = "1" ]; then
   snyk iac rules update >/dev/null || true
 fi
 
-# Plan each env dir -> JSON
 plan_jsons=()
-for d in "${env_dirs[@]}"; do
-  outdir="$d/.terragrunt-snyk"
-  mkdir -p "$outdir"
-  planbin="$outdir/plan.bin"
-  planjson="$outdir/tfplan.json"
 
-  echo "Planning: $d"
+# For each env root: plan -> show -> collect tfplan.json (continue on failures)
+for d in "${env_dirs[@]}"; do
+  echo "=== Planning in: $d"
   (
     cd "$d"
-    # Best effort: don’t fail the entire hook if one stack fails
-    if terragrunt plan ${TG_PLAN_ARGS} -out="$planbin" >/dev/null 2>&1; then
-      if terraform show -json "$planbin" > "$planjson" 2>/dev/null; then
-        plan_jsons+=("$planjson")
+
+    # Remove stale artifacts to avoid confusion
+    rm -f tf.plan tfplan.json || true
+
+    # Best-effort plan; don't fail the whole hook if this one fails
+    set +e
+    terragrunt plan ${TF_PLAN_ARGS} -out=tf.plan
+    rc=$?
+    set -e
+
+    if [ $rc -ne 0 ]; then
+      echo "WARN: terragrunt plan failed in $d; skipping."
+      exit 0
+    fi
+
+    # Convert to JSON (must run from same dir)
+    if terraform show -json tf.plan > tfplan.json 2>/dev/null; then
+      # Only add if non-empty
+      if [ -s tfplan.json ]; then
+        plan_jsons+=("$PWD/tfplan.json")
       else
-        echo "WARN: terraform show failed in $d; skipping." >&2
-        rm -f "$planjson" || true
+        echo "WARN: empty tfplan.json in $d; skipping."
+        rm -f tfplan.json || true
       fi
     else
-      echo "WARN: terragrunt plan failed in $d; skipping." >&2
-      rm -f "$planbin" || true
+      echo "WARN: terraform show failed in $d; skipping."
+      rm -f tfplan.json || true
     fi
   )
 done
@@ -92,7 +114,7 @@ common_args=( "iac" "test" "--severity-threshold=${SNYK_SEVERITY}" "--scan=plann
 [ -n "$SNYK_ORG" ] && common_args+=( "--org=${SNYK_ORG}" )
 
 rc=0
-# Chunk to avoid very long command lines
+# Chunk to avoid very long argv
 chunk_size=50
 i=0
 total=${#plan_jsons[@]}
